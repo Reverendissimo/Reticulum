@@ -63,6 +63,10 @@ class QUICSyncClientInterface(Interface):
     - target_host: Hostname or IP address of the QUIC server
     - target_port: Port number of the QUIC server (default: 8443)
     - verify_certificate: Whether to verify server certificates (default: True)
+    - reconnect_enabled: Enable automatic reconnection (default: True)
+    - reconnect_interval: Initial reconnection interval in seconds (default: 5.0)
+    - max_reconnect_interval: Maximum reconnection interval in seconds (default: 60.0)
+    - max_reconnect_attempts: Maximum reconnection attempts, 0 = unlimited (default: 0)
     """
     
     BITRATE_GUESS = 10*1000*1000  # 10 Mbps estimated bandwidth
@@ -111,6 +115,12 @@ class QUICSyncClientInterface(Interface):
         target_port = c.get("target_port", 8443)
         verify_certificate = c.as_bool("verify_certificate") if "verify_certificate" in c else True
         
+        # Parse reconnection settings
+        self.reconnect_enabled = c.as_bool("reconnect_enabled") if "reconnect_enabled" in c else True
+        self.reconnect_interval = c.get("reconnect_interval", 5.0)
+        self.max_reconnect_interval = c.get("max_reconnect_interval", 60.0)
+        self.max_reconnect_attempts = c.get("max_reconnect_attempts", 0)  # 0 = unlimited
+        
         # Set required attributes for Reticulum compatibility
         self.owner = owner
         self.name = name
@@ -142,6 +152,9 @@ class QUICSyncClientInterface(Interface):
         self.stream_id = 2  # Use stream 2 for client-to-server data (bidirectional)
         self.keepalive_stream_id = 1  # Use stream 1 for keepalive
         
+        # Reconnection state
+        self.reconnect_attempts = 0
+        
         # Statistics
         self.rxb = 0  # Received bytes
         self.txb = 0  # Transmitted bytes
@@ -158,10 +171,11 @@ class QUICSyncClientInterface(Interface):
 
     def _client_thread(self):
         """
-        Main QUIC client thread that runs the asyncio event loop.
+        Main QUIC client thread that runs the asyncio event loop with automatic reconnection.
         
         This method runs in a separate thread and handles all QUIC client operations
         including connecting to servers, processing events, and managing the connection lifecycle.
+        It includes automatic reconnection logic with exponential backoff.
         """
         try:
             import asyncio
@@ -175,35 +189,76 @@ class QUICSyncClientInterface(Interface):
                 verify_certificate=self.verify_certificate
             )
             
-            # Start client connection
-            RNS.log(f"Connecting to QUIC server at {self.target_host}:{self.target_port}", RNS.LOG_INFO)
-            
-            async def connect_async():
-                """Async function to connect to the QUIC server"""
+            # Main connection loop with reconnection
+            while not self.detached and self.reconnect_enabled:
                 try:
-                    async with connect(
-                        self.target_host,
-                        self.target_port,
-                        configuration=self.configuration,
-                        create_protocol=lambda quic, stream_handler: QUICSyncClientProtocol(self, quic, stream_handler)
-                    ) as protocol:
-                        self.protocol = protocol
-                        RNS.log("QUIC connection established", RNS.LOG_INFO)
-                        self.online = True
-                        
-                        # Keep connection alive
+                    # Check if we should attempt reconnection
+                    if self.max_reconnect_attempts > 0 and self.reconnect_attempts >= self.max_reconnect_attempts:
+                        RNS.log(f"Maximum reconnection attempts ({self.max_reconnect_attempts}) reached. Giving up.", RNS.LOG_ERROR)
+                        break
+                    
+                    # Reset reconnection interval on successful connection
+                    if self.reconnect_attempts > 0:
+                        self.reconnect_interval = 5.0
+                        self.reconnect_attempts = 0
+                        RNS.log("Connection restored, resetting reconnection interval", RNS.LOG_INFO)
+                    
+                    # Start client connection
+                    RNS.log(f"Connecting to QUIC server at {self.target_host}:{self.target_port}", RNS.LOG_INFO)
+                    
+                    async def connect_async():
+                        """Async function to connect to the QUIC server"""
                         try:
-                            await protocol.wait_closed()
+                            async with connect(
+                                self.target_host,
+                                self.target_port,
+                                configuration=self.configuration,
+                                create_protocol=lambda quic, stream_handler: QUICSyncClientProtocol(self, quic, stream_handler)
+                            ) as protocol:
+                                self.protocol = protocol
+                                RNS.log("QUIC connection established", RNS.LOG_INFO)
+                                self.online = True
+                                
+                                # Keep connection alive
+                                try:
+                                    await protocol.wait_closed()
+                                except Exception as e:
+                                    RNS.log(f"QUIC connection error: {e}", RNS.LOG_ERROR)
                         except Exception as e:
-                            RNS.log(f"QUIC connection error: {e}", RNS.LOG_ERROR)
+                            RNS.log(f"Failed to connect to QUIC server: {e}", RNS.LOG_ERROR)
+                            import traceback
+                            RNS.log(traceback.format_exc(), RNS.LOG_ERROR)
+                            self.online = False
+                    
+                    # Run the client
+                    self.event_loop.run_until_complete(connect_async())
+                    
+                    # If we reach here, the connection was lost
+                    self.online = False
+                    self.protocol = None
+                    
+                    # Attempt reconnection if enabled
+                    if self.reconnect_enabled and not self.detached:
+                        self.reconnect_attempts += 1
+                        RNS.log(f"Connection lost. Attempting reconnection {self.reconnect_attempts} in {self.reconnect_interval:.1f} seconds...", RNS.LOG_WARNING)
+                        
+                        # Wait before reconnecting with exponential backoff
+                        time.sleep(self.reconnect_interval)
+                        
+                        # Increase interval for next attempt (exponential backoff)
+                        self.reconnect_interval = min(self.reconnect_interval * 1.5, self.max_reconnect_interval)
+                        
                 except Exception as e:
-                    RNS.log(f"Failed to connect to QUIC server: {e}", RNS.LOG_ERROR)
+                    RNS.log(f"Error in client thread: {e}", RNS.LOG_ERROR)
                     import traceback
                     RNS.log(traceback.format_exc(), RNS.LOG_ERROR)
                     self.online = False
+                    
+                    # Wait before retrying
+                    if self.reconnect_enabled and not self.detached:
+                        time.sleep(self.reconnect_interval)
             
-            # Run the client
-            self.event_loop.run_until_complete(connect_async())
+            RNS.log("QUIC client thread exiting", RNS.LOG_INFO)
             
         except Exception as e:
             RNS.log(f"Failed to start QUIC client: {e}", RNS.LOG_ERROR)
@@ -292,6 +347,25 @@ class QUICSyncClientInterface(Interface):
             data (bytes): Outgoing data from Reticulum
         """
         self.outgoing_queue.put(data)
+
+    def set_reconnect_enabled(self, enabled):
+        """
+        Enable or disable automatic reconnection.
+        
+        Args:
+            enabled (bool): True to enable reconnection, False to disable
+        """
+        self.reconnect_enabled = enabled
+        if enabled:
+            RNS.log("Automatic reconnection enabled", RNS.LOG_INFO)
+        else:
+            RNS.log("Automatic reconnection disabled", RNS.LOG_INFO)
+
+    def reset_reconnect_attempts(self):
+        """Reset the reconnection attempt counter."""
+        self.reconnect_attempts = 0
+        self.reconnect_interval = 5.0
+        RNS.log("Reconnection attempts reset", RNS.LOG_DEBUG)
 
     def __str__(self):
         """Return string representation of the interface."""
