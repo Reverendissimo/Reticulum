@@ -1,4 +1,16 @@
 #!/usr/bin/env python3
+"""
+QUIC Client Interface for Reticulum
+
+This module provides a QUIC-based transport interface for the Reticulum mesh networking stack.
+It implements a client that connects to QUIC servers and forwards Reticulum packets bidirectionally.
+
+The interface runs in its own dedicated thread with an asyncio event loop, communicating
+with the main Reticulum thread through thread-safe queues.
+
+Author: Reticulum QUIC Implementation
+License: Reticulum License
+"""
 
 import RNS
 try:
@@ -29,19 +41,45 @@ except ImportError:
 if HAS_AIOQUIC:
     H3_ALPN = ["h3"]
 
+
 class QUICSyncClientInterface(Interface):
     """
-    Simple QUIC Client Interface for Reticulum
-    Runs in its own thread, uses queues for communication with RNS
+    QUIC Client Interface for Reticulum
+    
+    This interface implements a QUIC client that connects to QUIC servers
+    and forwards Reticulum packets bidirectionally. It uses a dedicated thread with
+    an asyncio event loop for QUIC operations and communicates with Reticulum through
+    thread-safe queues.
+    
+    The interface supports:
+    - Automatic connection to QUIC servers
+    - Bidirectional data transfer
+    - Automatic reconnection on connection loss
+    - Keepalive mechanism
+    - Thread-safe operation
+    
+    Configuration parameters:
+    - name: Interface name for identification
+    - target_host: Hostname or IP address of the QUIC server
+    - target_port: Port number of the QUIC server (default: 8443)
+    - verify_certificate: Whether to verify server certificates (default: True)
     """
     
-    BITRATE_GUESS = 10*1000*1000  # 10 Mbps
-    DEFAULT_IFAC_SIZE = 16
-    HW_MTU = 1200
+    BITRATE_GUESS = 10*1000*1000  # 10 Mbps estimated bandwidth
+    DEFAULT_IFAC_SIZE = 16        # Default interface size
+    HW_MTU = 1200                 # Hardware MTU for QUIC
     
     @staticmethod
     def create_configuration(verify_certificate=True):
-        """Create QUIC configuration for client"""
+        """
+        Create and configure a QuicConfiguration object for the client.
+        
+        Args:
+            verify_certificate (bool): Whether to verify server certificates
+        
+        Returns:
+            QuicConfiguration: Configured QUIC configuration object
+        """
         configuration = QuicConfiguration(
             alpn_protocols=H3_ALPN,
             is_client=True,
@@ -57,27 +95,35 @@ class QUICSyncClientInterface(Interface):
         return configuration
 
     def __init__(self, owner, configuration):
+        """
+        Initialize the QUIC client interface.
+        
+        Args:
+            owner: Reticulum instance that owns this interface
+            configuration: Configuration object containing interface parameters
+        """
         super().__init__()
         
-        # Parse configuration
+        # Parse configuration parameters
         c = Interface.get_config_obj(configuration)
         name = c["name"]
         target_host = c["target_host"]
         target_port = c.get("target_port", 8443)
         verify_certificate = c.as_bool("verify_certificate") if "verify_certificate" in c else True
         
-        # Set required attributes
+        # Set required attributes for Reticulum compatibility
         self.owner = owner
         self.name = name
         
         if not HAS_AIOQUIC:
             raise ImportError("aioquic library is required for QUIC interfaces")
         
+        # Store configuration parameters
         self.target_host = target_host
         self.target_port = target_port
         self.verify_certificate = verify_certificate
         
-        # Interface properties
+        # Interface properties required by Reticulum
         self.HW_MTU = 1200
         self.bitrate = 1000000  # 1 Mbps estimate
         self.online = False
@@ -85,20 +131,20 @@ class QUICSyncClientInterface(Interface):
         self.OUT = True
         self.detached = False
         
-        # Thread-safe communication with RNS
-        self.incoming_queue = queue.Queue()  # QUIC → RNS
-        self.outgoing_queue = queue.Queue()  # RNS → QUIC
+        # Thread-safe communication with Reticulum
+        self.incoming_queue = queue.Queue()  # QUIC → Reticulum
+        self.outgoing_queue = queue.Queue()  # Reticulum → QUIC
         
         # QUIC client state
         self.protocol = None
         self.event_loop = None
         self.configuration = None
-        self.stream_id = 2  # Use stream 2 for data (bidirectional)
+        self.stream_id = 2  # Use stream 2 for client-to-server data (bidirectional)
         self.keepalive_stream_id = 1  # Use stream 1 for keepalive
         
         # Statistics
-        self.rxb = 0
-        self.txb = 0
+        self.rxb = 0  # Received bytes
+        self.txb = 0  # Transmitted bytes
         
         # Start the QUIC client thread
         self.client_thread = threading.Thread(target=self._client_thread, daemon=True)
@@ -111,7 +157,12 @@ class QUICSyncClientInterface(Interface):
         RNS.log(f"QUICSyncClientInterface configured for {target_host}:{target_port}", RNS.LOG_INFO)
 
     def _client_thread(self):
-        """Main QUIC client thread - runs asyncio event loop"""
+        """
+        Main QUIC client thread that runs the asyncio event loop.
+        
+        This method runs in a separate thread and handles all QUIC client operations
+        including connecting to servers, processing events, and managing the connection lifecycle.
+        """
         try:
             import asyncio
             
@@ -128,6 +179,7 @@ class QUICSyncClientInterface(Interface):
             RNS.log(f"Connecting to QUIC server at {self.target_host}:{self.target_port}", RNS.LOG_INFO)
             
             async def connect_async():
+                """Async function to connect to the QUIC server"""
                 try:
                     async with connect(
                         self.target_host,
@@ -160,21 +212,35 @@ class QUICSyncClientInterface(Interface):
             self.online = False
 
     def _create_protocol(self, *args, **kwargs):
-        """Create a QUIC protocol instance"""
+        """
+        Create a QUIC protocol instance for the connection.
+        
+        Args:
+            *args: Variable length argument list
+            **kwargs: Arbitrary keyword arguments
+            
+        Returns:
+            QUICSyncClientProtocol: Protocol instance for the connection
+        """
         return QUICSyncClientProtocol(self)
 
     def _queue_processor(self):
-        """Process queues - forwards data between QUIC and RNS"""
+        """
+        Process data queues between QUIC and Reticulum.
+        
+        This method runs in a separate thread and continuously processes data
+        flowing between the QUIC connection and the Reticulum transport layer.
+        """
         while not self.detached:
             try:
-                # Process outgoing data from RNS to QUIC server
+                # Process outgoing data from Reticulum to QUIC server
                 try:
                     data = self.outgoing_queue.get(timeout=0.1)
                     self._send_to_quic_server(data)
                 except queue.Empty:
                     pass
                 
-                # Process incoming data from QUIC server to RNS
+                # Process incoming data from QUIC server to Reticulum
                 try:
                     data = self.incoming_queue.get(timeout=0.1)
                     self.process_incoming(data)
@@ -186,15 +252,17 @@ class QUICSyncClientInterface(Interface):
                 time.sleep(0.1)
 
     def _send_to_quic_server(self, data):
-        """Send data to QUIC server"""
+        """
+        Send data to the QUIC server.
+        
+        Args:
+            data (bytes): Data to send to the server
+        """
         if not self.online or not self.protocol:
-            RNS.log(f"Cannot send data: online={self.online}, protocol={self.protocol is not None}", RNS.LOG_DEBUG)
             return
             
         try:
-            RNS.log(f"Sending {len(data)} bytes to QUIC server", RNS.LOG_DEBUG)
-            
-            # Send data using the protocol
+            # Send data using the protocol on client-initiated stream 2
             self.protocol._quic.send_stream_data(self.stream_id, data, end_stream=False)
             self.protocol.transmit()
             
@@ -207,68 +275,97 @@ class QUICSyncClientInterface(Interface):
             self.protocol = None
 
     def process_incoming(self, data):
-        """Handle incoming data from Transport layer - forward to RNS"""
+        """
+        Handle incoming data from QUIC server and forward to Reticulum.
+        
+        Args:
+            data (bytes): Incoming data from QUIC server
+        """
         self.rxb += len(data)
         self.owner.inbound(data, self)
 
     def process_outgoing(self, data):
-        """Handle outgoing data from Transport layer - put in outgoing queue"""
+        """
+        Handle outgoing data from Reticulum and queue for QUIC transmission.
+        
+        Args:
+            data (bytes): Outgoing data from Reticulum
+        """
         self.outgoing_queue.put(data)
 
     def __str__(self):
+        """Return string representation of the interface."""
         return f"QUICSyncClientInterface[{self.name}/{self.target_host}:{self.target_port}]"
 
 
 class QUICSyncClientProtocol(QuicConnectionProtocol):
-    """QUIC Protocol handler for synchronous client"""
+    """
+    QUIC Protocol handler for client connections.
+    
+    This class handles the QUIC connection to the server, processing
+    incoming data and managing connection state including keepalive.
+    """
     
     def __init__(self, parent, quic=None, stream_handler=None):
+        """
+        Initialize the client protocol.
+        
+        Args:
+            parent: Parent QUICSyncClientInterface instance
+            quic: QUIC connection object
+            stream_handler: Stream handler for the connection
+        """
         super().__init__(quic, stream_handler)
         self.parent = parent
         self.keepalive_task = None
     
     def quic_event_received(self, event: QuicEvent) -> None:
-        """Handle QUIC events"""
+        """
+        Handle QUIC events from the connection.
+        
+        Args:
+            event (QuicEvent): QUIC event to process
+        """
         super().quic_event_received(event)
         
         if isinstance(event, StreamDataReceived):
             if event.stream_id == self.parent.keepalive_stream_id:
-                # Handle keepalive response
-                RNS.log(f"Client received keepalive response: {event.data}", RNS.LOG_DEBUG)
+                # Handle keepalive response - no action needed
+                pass
             elif event.stream_id == 3:
-                # Handle RNS data on stream 3 (server-initiated)
-                RNS.log(f"Client received {len(event.data)} bytes from QUIC server on stream 3", RNS.LOG_INFO)
-                
-                # Put data in incoming queue for RNS
+                # Handle Reticulum data on stream 3 (server-initiated)
                 if event.data:
                     self.parent.incoming_queue.put(event.data)
             elif event.stream_id == 2:
-                # Handle RNS data on stream 2 (client-initiated, bidirectional)
-                RNS.log(f"Client received {len(event.data)} bytes from QUIC server on stream 2", RNS.LOG_INFO)
-                
-                # Put data in incoming queue for RNS
+                # Handle Reticulum data on stream 2 (client-initiated, bidirectional)
                 if event.data:
                     self.parent.incoming_queue.put(event.data)
-            else:
-                # Handle other streams
-                RNS.log(f"Client received {len(event.data)} bytes on stream {event.stream_id}", RNS.LOG_DEBUG)
             
         elif isinstance(event, ConnectionTerminated):
             RNS.log(f"QUIC connection terminated: {event.error_code}", RNS.LOG_INFO)
             self.parent.online = False
 
     def connection_made(self, transport):
-        """Called when connection is established"""
+        """
+        Called when a QUIC connection is established.
+        
+        Args:
+            transport: Transport object for the connection
+        """
         super().connection_made(transport)
         RNS.log("QUIC client connection established", RNS.LOG_INFO)
         
         # Start keepalive task
         import asyncio
         self.keepalive_task = asyncio.create_task(self._keepalive_loop())
-        RNS.log("Started keepalive task", RNS.LOG_DEBUG)
 
     def connection_lost(self, exc):
-        """Called when connection is lost"""
+        """
+        Called when a QUIC connection is lost.
+        
+        Args:
+            exc: Exception that caused the connection loss, or None
+        """
         super().connection_lost(exc)
         if exc:
             RNS.log(f"QUIC client connection lost: {exc}", RNS.LOG_WARNING)
@@ -282,29 +379,31 @@ class QUICSyncClientProtocol(QuicConnectionProtocol):
             self.keepalive_task.cancel()
     
     async def _keepalive_loop(self):
-        """Send periodic keepalive packets on dedicated stream"""
+        """
+        Send periodic keepalive packets to maintain the connection.
+        
+        Sends a single byte 'K' on stream 1 every 10 seconds to prevent
+        the connection from timing out due to inactivity.
+        """
+        import asyncio
         try:
-            RNS.log("Keepalive loop started", RNS.LOG_DEBUG)
-            RNS.log(f"Initial state: online={self.parent.online}, detached={self.parent.detached}", RNS.LOG_DEBUG)
             while self.parent.online and not self.parent.detached:
                 await asyncio.sleep(10)  # Send keepalive every 10 seconds
-                RNS.log(f"Keepalive check: online={self.parent.online}, protocol={self.parent.protocol is not None}, detached={self.parent.detached}", RNS.LOG_DEBUG)
                 if self.parent.online and self.parent.protocol and not self.parent.detached:
                     try:
                         # Send 1 byte keepalive on dedicated stream
                         keepalive_data = b"K"  # Single byte keepalive
                         self._quic.send_stream_data(self.parent.keepalive_stream_id, keepalive_data, end_stream=False)
                         self.transmit()
-                        RNS.log("Sent keepalive packet on stream 1", RNS.LOG_DEBUG)
                     except Exception as e:
                         RNS.log(f"Keepalive failed: {e}", RNS.LOG_DEBUG)
                         break
-                else:
-                    RNS.log("Skipping keepalive: not online or no protocol", RNS.LOG_DEBUG)
         except asyncio.CancelledError:
-            RNS.log("Keepalive task cancelled", RNS.LOG_DEBUG)
+            # Task was cancelled, which is expected when connection is lost
+            pass
         except Exception as e:
             RNS.log(f"Keepalive loop error: {e}", RNS.LOG_ERROR)
+
 
 # Define the interface class for RNS
 interface_class = QUICSyncClientInterface
