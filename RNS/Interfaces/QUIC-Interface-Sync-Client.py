@@ -150,7 +150,7 @@ class QUICSyncClientInterface(Interface):
         self.event_loop = None
         self.configuration = None
         self.stream_id = 2  # Use stream 2 for client-to-server data (bidirectional)
-        self.keepalive_stream_id = 1  # Use stream 1 for keepalive
+        self.keepalive_stream_id = 0  # Use stream 0 for keepalive (client-initiated bidirectional)
         
         # Reconnection state
         self.reconnect_attempts = 0
@@ -429,9 +429,13 @@ class QUICSyncClientProtocol(QuicConnectionProtocol):
         super().connection_made(transport)
         RNS.log("QUIC client connection established", RNS.LOG_INFO)
         
-        # Start keepalive task
+        # Start keepalive task after a short delay to ensure parent.online is set
         import asyncio
-        self.keepalive_task = asyncio.create_task(self._keepalive_loop())
+        async def delayed_keepalive_start():
+            await asyncio.sleep(0.5)  # Wait for parent.online to be set
+            self.keepalive_task = asyncio.create_task(self._keepalive_loop())
+        
+        asyncio.create_task(delayed_keepalive_start())
 
     def connection_lost(self, exc):
         """
@@ -456,7 +460,7 @@ class QUICSyncClientProtocol(QuicConnectionProtocol):
         """
         Send periodic keepalive packets to maintain the connection.
         
-        Sends a single byte 'K' on stream 1 every 10 seconds to prevent
+        Sends a single byte 'K' on stream 0 every 10 seconds to prevent
         the connection from timing out due to inactivity.
         """
         import asyncio
